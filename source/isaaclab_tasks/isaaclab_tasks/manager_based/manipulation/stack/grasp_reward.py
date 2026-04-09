@@ -137,14 +137,39 @@ def transport_reward(env, std=0.08):
     return lifted.float() * (1 - torch.tanh(xy_dist / std))
 
 
+# Per-env grasp tracking — did this env grasp the cube at any point?
+_grasp_tracker = None
+
+def _init_grasp_tracker(num_envs, device):
+    global _grasp_tracker
+    _grasp_tracker = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+def _update_grasp_tracker(env):
+    """Call every step to track if cube was lifted."""
+    global _grasp_tracker
+    if _grasp_tracker is None:
+        _init_grasp_tracker(env.num_envs, env.device)
+    obj: RigidObject = env.scene["cube_1"]
+    height = obj.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    currently_lifted = height > 0.08  # well above table + cube2
+    _grasp_tracker = _grasp_tracker | currently_lifted
+
+def _reset_grasp_tracker(env_ids):
+    global _grasp_tracker
+    if _grasp_tracker is not None:
+        _grasp_tracker[env_ids] = False
+
+
 def stack_reward(env):
-    """Binary: is cube1 stacked on cube2?"""
+    """Stacking reward gated on ACTUAL grasping (cube was lifted >8cm at some point)."""
+    _update_grasp_tracker(env)
     obj1: RigidObject = env.scene["cube_1"]
     obj2: RigidObject = env.scene["cube_2"]
     xy_dist = torch.norm(obj1.data.root_pos_w[:, :2] - obj2.data.root_pos_w[:, :2], dim=1)
     z_above = obj1.data.root_pos_w[:, 2] - obj2.data.root_pos_w[:, 2]
     stacked = (xy_dist < 0.04) & (z_above > 0.02) & (z_above < 0.10)
-    return stacked.float()
+    # Only count if cube was grasped (lifted >8cm) at some point this episode
+    return (stacked & _grasp_tracker).float()
 
 
 def action_penalty(env):
@@ -159,11 +184,35 @@ def action_penalty(env):
 def grasp_curriculum(env, env_ids):
     if not hasattr(grasp_curriculum, "_n"):
         grasp_curriculum._n = 0
+        grasp_curriculum._difficulty = torch.zeros(env.num_envs, device=env.device)
     grasp_curriculum._n += 1
 
     cfg = _load_cfg()
+    d = grasp_curriculum._difficulty
 
-    # Apply reward weights from config every 50 calls
+    if isinstance(env_ids, torch.Tensor):
+        ids = env_ids
+    else:
+        ids = torch.tensor(env_ids, device=env.device, dtype=torch.long) if not isinstance(env_ids, slice) else torch.arange(env.num_envs, device=env.device)
+
+    # Update per-env difficulty based on stacking success
+    if ids.numel() > 0 and grasp_curriculum._n > 2:
+        _update_grasp_tracker(env)
+        obj1: RigidObject = env.scene["cube_1"]
+        obj2: RigidObject = env.scene["cube_2"]
+        xy_dist = torch.norm(obj1.data.root_pos_w[ids, :2] - obj2.data.root_pos_w[ids, :2], dim=1)
+        z_above = obj1.data.root_pos_w[ids, 2] - obj2.data.root_pos_w[ids, 2]
+        stacked = (xy_dist < 0.04) & (z_above > 0.02) & (z_above < 0.10) & _grasp_tracker[ids]
+        # Promote on stack success (make harder = cube2 farther)
+        # Demote on failure (make easier = cube2 closer)
+        step_up = cfg.get("step_up", 0.02)
+        step_down = cfg.get("step_down", 0.003)
+        promotion_only = d[ids] < cfg.get("promotion_only_until", 0.3)
+        demote = torch.where(promotion_only, torch.zeros_like(d[ids]), torch.full_like(d[ids], step_down))
+        delta = torch.where(stacked, step_up, -demote)
+        d[ids] = (d[ids] + delta).clamp(0.0, 1.0)
+
+    # Apply reward weights from config
     if grasp_curriculum._n % 50 == 0:
         weights = cfg.get("reward_weights", {})
         for name, w in weights.items():
@@ -173,42 +222,73 @@ def grasp_curriculum(env, env_ids):
             except (ValueError, IndexError):
                 pass
 
+    mean_d = d.mean().item()
+    d10 = torch.quantile(d, 0.1).item()
+    d90 = torch.quantile(d, 0.9).item()
+
     # Compute metrics
     with torch.no_grad():
-        approach = approach_reward(env).mean().item()
-        pre_grasp = pre_grasp_reward(env).mean().item()
-        contact = finger_contact_reward(env).mean().item()
-        grasped = grasp_success_reward(env).mean().item()
-        transported = transport_reward(env).mean().item()
-        stacked = stack_reward(env).mean().item()
+        approach_v = approach_reward(env).mean().item()
+        grasp_v = grasp_success_reward(env).mean().item()
+        stack_v = stack_reward(env).mean().item()
 
     return {
-        "approach": approach,
-        "pre_grasp": pre_grasp,
-        "finger_contact": contact,
-        "grasp_success": grasped,
-        "transport": transported,
-        "stack_success": stacked,
+        "approach": approach_v,
+        "grasp_success": grasp_v,
+        "stack_success": stack_v,
+        "mean_difficulty": mean_d,
+        "d10": d10,
+        "d90": d90,
         "config_version": cfg.get("version", 0),
     }
 
 
 def grasp_reset(env, env_ids, spawn_range=0.03):
-    """Reset with configurable spawn range."""
+    """Reset with configurable spawn + strategic cube2 positioning."""
     reset_scene_to_default(env, env_ids)
+    _reset_grasp_tracker(env_ids)
     cfg = _load_cfg()
     sr = cfg.get("spawn_range", spawn_range)
     
     cube1: RigidObject = env.scene["cube_1"]
-    states = cube1.data.default_root_state[env_ids].clone()
+    cube2: RigidObject = env.scene["cube_2"]
     n = len(env_ids)
+    
+    # Cube1 spawn
+    c1 = cube1.data.default_root_state[env_ids].clone()
     for i in range(n):
-        states[i, 0] += torch.empty(1).uniform_(-sr, sr).item()
-        states[i, 1] += torch.empty(1).uniform_(-sr * 2, sr * 2).item()
-    states[:, 0:3] += env.scene.env_origins[env_ids]
-    states[:, 7:13] = 0
-    cube1.write_root_pose_to_sim(states[:, :7], env_ids=env_ids)
-    cube1.write_root_velocity_to_sim(states[:, 7:13], env_ids=env_ids)
+        c1[i, 0] += torch.empty(1).uniform_(-sr, sr).item()
+        c1[i, 1] += torch.empty(1).uniform_(-sr * 2, sr * 2).item()
+    c1[:, 0:3] += env.scene.env_origins[env_ids]
+    c1[:, 7:13] = 0
+    cube1.write_root_pose_to_sim(c1[:, :7], env_ids=env_ids)
+    cube1.write_root_velocity_to_sim(c1[:, 7:13], env_ids=env_ids)
+    
+    # Cube2: per-env distance curriculum
+    # d=0: cube2 right next to cube1 (easy stacking)
+    # d=1: cube2 at default position (full task)
+    c2 = cube2.data.default_root_state[env_ids].clone()
+    c2_default = cube2.data.default_root_state[env_ids].clone()
+    tracker = getattr(grasp_curriculum, "_difficulty", None)
+    if tracker is not None:
+        d = tracker[env_ids]
+        for i in range(n):
+            di = d[i].item()
+            max_dist = 0.15
+            dist = max_dist * di
+            c1_local_x = c1[i, 0].item() - env.scene.env_origins[env_ids[i], 0].item()
+            c1_local_y = c1[i, 1].item() - env.scene.env_origins[env_ids[i], 1].item()
+            c2_def_x = c2_default[i, 0].item()
+            c2_def_y = c2_default[i, 1].item()
+            dx = c2_def_x - c1_local_x
+            dy = c2_def_y - c1_local_y
+            norm = max((dx**2 + dy**2)**0.5, 1e-6)
+            c2[i, 0] = c1_local_x + dist * dx / norm + torch.empty(1).uniform_(-0.01*di, 0.01*di).item()
+            c2[i, 1] = c1_local_y + dist * dy / norm + torch.empty(1).uniform_(-0.01*di, 0.01*di).item()
+    c2[:, 0:3] += env.scene.env_origins[env_ids]
+    c2[:, 7:13] = 0
+    cube2.write_root_pose_to_sim(c2[:, :7], env_ids=env_ids)
+    cube2.write_root_velocity_to_sim(c2[:, 7:13], env_ids=env_ids)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

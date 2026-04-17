@@ -249,3 +249,36 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# LLM-designed rewards (from scratch, no imports from mdp/rewards.py)
+gym.register(
+    id="Isaac-Stack-Cube-Franka-RL-LLMDesigned-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.stack_llm_designed_env_cfg:FrankaStackLLMDesignedCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StackCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+# LLM-Tutor v3: sequential skill training (one reward at a time)
+gym.register(
+    id="Isaac-Stack-Cube-Franka-RL-Sequential-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.stack_sequential_env_cfg:FrankaStackSequentialCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StackCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+# LLM-Tutor v2: distribution-based curriculum + robot rest goal
+gym.register(
+    id="Isaac-Stack-Cube-Franka-RL-GraspV2-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.stack_grasp_v2_env_cfg:FrankaStackGraspV2Cfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StackCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)

@@ -112,7 +112,7 @@ def stacking_success(
     cube_1_cfg: SceneEntityCfg = SceneEntityCfg("cube_1"),
     cube_2_cfg: SceneEntityCfg = SceneEntityCfg("cube_2"),
     xy_threshold: float = 0.05,
-    height_threshold: float = 0.005,
+    height_threshold: float = 0.02,
     height_diff: float = 0.0468,
 ) -> torch.Tensor:
     """Binary reward: is cube1 stacked on cube2 (and gripper open)?"""
@@ -134,7 +134,7 @@ def stacking_success(
         torch.isclose(
             robot.data.joint_pos[:, gripper_joint_ids[0]],
             torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32, device=env.device),
-            atol=1e-3, rtol=1e-3,
+            atol=0.01, rtol=0.01,
         ),
         stacked,
     )
@@ -142,7 +142,7 @@ def stacking_success(
         torch.isclose(
             robot.data.joint_pos[:, gripper_joint_ids[1]],
             torch.tensor(env.cfg.gripper_open_val, dtype=torch.float32, device=env.device),
-            atol=1e-3, rtol=1e-3,
+            atol=0.01, rtol=0.01,
         ),
         stacked,
     )

@@ -282,3 +282,14 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Release skill: open gripper, retract arm, rest (final skill)
+gym.register(
+    id="Isaac-Stack-Cube-Franka-RL-Release-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.stack_release_env_cfg:FrankaStackReleaseCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StackCubePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
